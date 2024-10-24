@@ -7,6 +7,7 @@ if (NOT MINGW)
 else ()
     set(LOAD_HTTPFS_TESTS "")
 endif()
+ set(LOAD_HTTPFS_TESTS "")
 
 duckdb_extension_load(httpfs
 	DONT_LINK
