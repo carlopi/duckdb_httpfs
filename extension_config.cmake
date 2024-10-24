@@ -2,11 +2,16 @@
 
 ################# HTTPFS
 # Windows MinGW tests for httpfs currently not working
-if (NOT MINGW)
+# But detection of MINGW do not seems to work appropriately
+if (MINGW)
     message(STATUS "I am not MINGW")
-    set(LOAD_HTTPFS_TESTS "LOAD_TESTS")
 else ()
     message(STATUS "I am on MINGW")
+endif()
+
+if (NOT WIN32)
+    set(LOAD_HTTPFS_TESTS "LOAD_TESTS")
+else ()
     set(LOAD_HTTPFS_TESTS "")
 endif()
 
