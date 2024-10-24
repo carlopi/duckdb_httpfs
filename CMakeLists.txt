@@ -6,7 +6,7 @@ project(HTTPFsExtension)
 
 add_extension_definitions()
 
-include_directories(extension/httpfs/include third_party/httplib)
+include_directories(extension/httpfs/include ${DUCKDB_MODULE_BASE_DIR}/third_party/httplib)
 
 build_static_extension(
   httpfs
