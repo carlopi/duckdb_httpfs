@@ -3,11 +3,12 @@
 ################# HTTPFS
 # Windows MinGW tests for httpfs currently not working
 if (NOT MINGW)
+    message(STATUS "I am not MINGW")
     set(LOAD_HTTPFS_TESTS "LOAD_TESTS")
 else ()
+    message(STATUS "I am on MINGW")
     set(LOAD_HTTPFS_TESTS "")
 endif()
- set(LOAD_HTTPFS_TESTS "")
 
 duckdb_extension_load(httpfs
 	DONT_LINK
