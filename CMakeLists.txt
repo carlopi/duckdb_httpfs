@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 2.8.12...3.29)
 
 set(HTTPFS_BASE_FOLDER "")
+set(TARGET_NAME httpfs)
 
 project(HTTPFsExtension)
 
