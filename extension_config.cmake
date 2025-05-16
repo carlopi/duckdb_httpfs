@@ -15,4 +15,5 @@ duckdb_extension_load(httpfs
 	SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
 	INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/extension/httpfs/include
 	${LOAD_HTTPFS_TESTS}
+        LINKED_LIBS "../../vcpkg_installed/wasm32-emscripten/lib/*.a ../../deps/local/lib/*.a"
 )
