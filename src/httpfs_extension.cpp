@@ -125,6 +125,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 			config.SetHTTPUtil(make_shared_ptr<HTTPFSCurlUtil>());
 			return;
 		}
+		if (value == "httplib-cached") {
+			config.SetHTTPUtil(make_shared_ptr<HTTPFSCachedUtil>());
+			return;
+		}
 		if (value == "httplib") {
 			config.SetHTTPUtil(make_shared_ptr<HTTPFSUtil>());
 			return;
