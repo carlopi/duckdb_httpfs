@@ -121,11 +121,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 #ifndef EMSCRIPTEN
 		// HTTP util classes are supposed to be cheap, which provides acces to the HTTP client, and generally don't
 		// store resources (i.e., connection pool).
-		if (value == "curl" || value == "default") {
+		if (value == "curl") {
 			config.SetHTTPUtil(make_shared_ptr<HTTPFSCurlUtil>());
 			return;
 		}
-		if (value == "httplib-cached") {
+		if (value == "httplib-cached" || value == "default") {
 			config.SetHTTPUtil(make_shared_ptr<HTTPFSCachedUtil>());
 			return;
 		}
@@ -149,7 +149,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		// Already handled, do not override
 	} else {
 #ifndef EMSCRIPTEN
-		config.SetHTTPUtil(make_shared_ptr<HTTPFSCurlUtil>());
+		config.SetHTTPUtil(make_shared_ptr<HTTPFSCachedUtil>());
 #else
 		config.SetHTTPUtil(make_shared_ptr<HTTPFSUtil>());
 #endif
