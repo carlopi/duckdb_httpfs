@@ -1011,9 +1011,21 @@ unique_ptr<HTTPClient> HTTPFileHandle::GetClient() {
 }
 
 unique_ptr<HTTPClient> HTTPFileHandle::CreateClient() {
-	// Create a new client
 	string path_out, proto_host_port;
 	HTTPUtil::DecomposeURL(path, path_out, proto_host_port);
+#ifndef EMSCRIPTEN
+	// Try to get a cached client from the global pool
+	auto *cached_util = dynamic_cast<HTTPFSCachedUtil *>(&http_params.http_util);
+	if (cached_util) {
+		auto client = cached_util->FindCachedCandidate(proto_host_port);
+		if (client) {
+			printf("HTTPFileHandle::CreateClient: reusing cached client for %s\n", proto_host_port.c_str());
+			client->Initialize(http_params);
+			return client;
+		}
+		printf("HTTPFileHandle::CreateClient: no cached client for %s, creating new\n", proto_host_port.c_str());
+	}
+#endif
 	return http_params.http_util.InitializeClient(http_params, proto_host_port);
 }
 
@@ -1023,6 +1035,20 @@ void HTTPFileHandle::StoreClient(unique_ptr<HTTPClient> client) {
 
 HTTPFileHandle::~HTTPFileHandle() {
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+#ifndef EMSCRIPTEN
+	// Return any cached clients to the global pool
+	auto *cached_util = dynamic_cast<HTTPFSCachedUtil *>(&http_params.http_util);
+	if (cached_util) {
+		auto client = client_cache.GetClient();
+		while (client) {
+			string path_out, proto_host_port;
+			HTTPUtil::DecomposeURL(path, path_out, proto_host_port);
+			printf("HTTPFileHandle::~HTTPFileHandle: returning client for %s to global pool\n", proto_host_port.c_str());
+			cached_util->StoreCachedCandidate(proto_host_port, std::move(client));
+			client = client_cache.GetClient();
+		}
+	}
+#endif
 }
 
 string HTTPFSUtil::GetName() const {
