@@ -51,7 +51,9 @@ bool HTTPFSCachedUtil::EnableCaching(BaseRequest &request) {
 }
 
 unique_ptr<HTTPResponse> HTTPFSCachedUtil::SendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client) {
+	bool caller_owns_client = client != nullptr;
 	bool caching = EnableCaching(request);
+
 	if (!client && caching) {
 		auto cached_client = FindCachedCandidate(request.proto_host_port);
 		if (cached_client) {
@@ -92,7 +94,8 @@ unique_ptr<HTTPResponse> HTTPFSCachedUtil::SendRequest(BaseRequest &request, uni
 	std::function<void(void)> on_retry([&]() { client = InitializeClient(request.params, request.proto_host_port); });
 
 	auto r = RunRequestWithRetry(on_request, request, on_retry);
-	if (caching) {
+	// Only cache if the caller didn't provide the client — otherwise the caller manages its lifecycle
+	if (caching && !caller_owns_client) {
 		StoreCachedCandidate(request.proto_host_port, std::move(client));
 	}
 	return std::move(r);
