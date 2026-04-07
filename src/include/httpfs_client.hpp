@@ -48,25 +48,9 @@ public:
 	unique_ptr<HTTPClient> InitializeClient(HTTPParams &http_params, const string &proto_host_port) override;
 
 	static unordered_map<string, string> ParseGetParameters(const string &text);
-	static shared_ptr<HTTPUtil> GetHTTPUtil(optional_ptr<FileOpener> opener);
-
-	string GetName() const override;
-};
-
-class HTTPFSCachedUtil : public HTTPFSUtil {
-public:
-	unique_ptr<HTTPClient> InitializeClient(HTTPParams &http_params, const string &proto_host_port) override;
-	virtual unique_ptr<HTTPResponse> SendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client) override;
-
-	static unordered_map<string, string> ParseGetParameters(const string &text);
 	static HTTPUtil &GetHTTPUtil(optional_ptr<FileOpener> opener);
 
 	string GetName() const override;
-
-	unique_ptr<HTTPClient> FindCachedCandidate(const string &proto_host_port);
-	void StoreCachedCandidate(const string &proto_host_port, unique_ptr<HTTPClient> &&client);
-	std::mutex cached_httpclients_mutex {};
-	std::vector<CachedHTTPClient> cached_httpclients;
 };
 
 #ifndef EMSCRIPTEN
@@ -78,6 +62,19 @@ public:
 	static unordered_map<string, string> ParseGetParameters(const string &text);
 
 	string GetName() const override;
+};
+
+class HTTPFSCachedUtil : public HTTPFSCurlUtil {
+public:
+	unique_ptr<HTTPResponse> SendRequest(BaseRequest &request, unique_ptr<HTTPClient> &client) override;
+
+	string GetName() const override;
+
+	bool EnableCaching(BaseRequest &request);
+	unique_ptr<HTTPClient> FindCachedCandidate(const string &proto_host_port);
+	void StoreCachedCandidate(const string &proto_host_port, unique_ptr<HTTPClient> &&client);
+	std::mutex cached_httpclients_mutex {};
+	std::vector<CachedHTTPClient> cached_httpclients;
 };
 
 #endif
