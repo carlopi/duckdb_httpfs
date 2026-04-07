@@ -129,6 +129,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 			config.SetHTTPUtil(make_shared_ptr<HTTPFSCachedUtil>());
 			return;
 		}
+		// FIXME: HTTPFSUtil is wrong as a string, should be HTTPFS. Or maybe we like that re-set means re-initialization?
 		if (value == "httplib") {
 			config.SetHTTPUtil(make_shared_ptr<HTTPFSUtil>());
 			return;
