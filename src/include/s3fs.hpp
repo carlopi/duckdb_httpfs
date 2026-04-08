@@ -161,7 +161,7 @@ public:
 	}
 
 	BufferManager &buffer_manager;
-	GlobCache glob_cache;
+	BucketCache bucket_cache;
 	string GetName() const override;
 
 public:
@@ -234,7 +234,7 @@ protected:
 struct AWSListObjectV2 {
 	static string Request(const string &path, HTTPParams &http_params, S3AuthParams &s3_auth_params,
 	                      string &continuation_token, bool use_delimiter = false,
-	                      optional_idx max_keys = optional_idx());
+	                      optional_idx max_keys = optional_idx(), const string &start_after = "");
 	static void ParseFileList(string &aws_response, vector<OpenFileInfo> &result);
 	static vector<string> ParseCommonPrefix(string &aws_response);
 	static string ParseContinuationToken(string &aws_response);
