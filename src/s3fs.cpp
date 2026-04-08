@@ -17,6 +17,7 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 #include "s3_multi_part_upload.hpp"
 
 #include "create_secret_functions.hpp"
@@ -1013,6 +1014,10 @@ protected:
 	bool ExpandNextPath() const override;
 
 private:
+	//! Try to validate a cached glob result using parallel requests. Returns true if cache is valid.
+	bool TryValidateCache(GlobCacheEntry &cache_entry);
+
+	S3FileSystem &fs;
 	string glob_pattern;
 	optional_ptr<FileOpener> opener;
 	mutable bool finished = false;
@@ -1024,10 +1029,17 @@ private:
 	mutable string common_prefix_continuation_token;
 	mutable vector<string> common_prefixes;
 	mutable GlobType glob_type {UNKNOWN};
+
+	//! Track requests/responses for caching (only for flat/LISTING globs)
+	mutable vector<GlobCacheRequest> recorded_requests;
+	mutable vector<string> recorded_responses;
+	//! Whether this glob is cacheable (only flat listing globs)
+	mutable bool is_cacheable = true;
 };
 
-S3GlobResult::S3GlobResult(S3FileSystem &fs, const string &glob_pattern_p, optional_ptr<FileOpener> opener)
-    : LazyMultiFileList(FileOpener::TryGetClientContext(opener)), glob_pattern(glob_pattern_p), opener(opener) {
+S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, optional_ptr<FileOpener> opener)
+    : LazyMultiFileList(FileOpener::TryGetClientContext(opener)), fs(fs_p), glob_pattern(glob_pattern_p),
+      opener(opener) {
 	if (!opener) {
 		throw InternalException("Cannot S3 Glob without FileOpener");
 	}
@@ -1057,6 +1069,23 @@ S3GlobResult::S3GlobResult(S3FileSystem &fs, const string &glob_pattern_p, optio
 	shared_path = parsed_glob_url.substr(0, first_wildcard_pos);
 
 	fs.ReadQueryParams(parsed_s3_url.query_param, s3_auth_params);
+
+	// Check the glob cache — if we have a cached result, try to validate it
+	GlobCacheEntry cache_entry;
+	if (fs.glob_cache.Find(glob_pattern, cache_entry)) {
+		printf("[GlobCache] HIT for '%s' (%zu pages cached, %zu files)\n", glob_pattern.c_str(),
+		       cache_entry.requests.size(), cache_entry.expanded_files.size());
+		if (TryValidateCache(cache_entry)) {
+			printf("[GlobCache] VALID — using cached result\n");
+			expanded_files = std::move(cache_entry.expanded_files);
+			finished = true;
+			all_files_expanded = true;
+		} else {
+			printf("[GlobCache] INVALID — falling back to sequential glob\n");
+		}
+	} else {
+		printf("[GlobCache] MISS for '%s'\n", glob_pattern.c_str());
+	}
 }
 
 bool S3GlobResult::ExpandNextPath() const {
@@ -1071,6 +1100,9 @@ bool S3GlobResult::ExpandNextPath() const {
 
 	vector<OpenFileInfo> s3_keys;
 	if (!current_common_prefix.empty()) {
+		// Hierarchical glob — not cacheable for now
+		is_cacheable = false;
+
 		// we have common prefixes left to scan - perform the request
 		auto prefix_path = parsed_s3_url.prefix + parsed_s3_url.bucket + '/' + current_common_prefix;
 
@@ -1120,6 +1152,8 @@ bool S3GlobResult::ExpandNextPath() const {
 		bool perform_listing = (glob_type != GlobType::HIERARCHICAL);
 
 		// First perform listing once (default will get back up to 1000 elements)
+		// Record the request for caching before we make it
+		string pre_request_token = main_continuation_token;
 		string response_str = AWSListObjectV2::Request(shared_path, *http_params, s3_auth_params,
 		                                               main_continuation_token, !perform_listing);
 
@@ -1172,6 +1206,18 @@ bool S3GlobResult::ExpandNextPath() const {
 			// we have common prefixes - set one up for the next request
 			current_common_prefix = common_prefixes.back();
 			common_prefixes.pop_back();
+			// Hierarchical glob — not cacheable for now
+			is_cacheable = false;
+		}
+
+		// Record this request/response for caching (flat listing only)
+		if (is_cacheable) {
+			GlobCacheRequest req;
+			req.path = shared_path;
+			req.continuation_token = pre_request_token;
+			req.use_delimiter = !perform_listing;
+			recorded_requests.push_back(std::move(req));
+			recorded_responses.push_back(response_str);
 		}
 	}
 
@@ -1198,7 +1244,105 @@ bool S3GlobResult::ExpandNextPath() const {
 			expanded_files.push_back(std::move(s3_key));
 		}
 	}
+
+	// Store to cache when glob is complete (flat listing only)
+	if (finished && is_cacheable) {
+		printf("[GlobCache] STORE '%s' — %zu pages, %zu files\n", glob_pattern.c_str(), recorded_requests.size(),
+		       expanded_files.size());
+		GlobCacheEntry entry;
+		entry.requests = std::move(recorded_requests);
+		entry.responses = std::move(recorded_responses);
+		entry.expanded_files = expanded_files;
+		fs.glob_cache.Insert(glob_pattern, std::move(entry));
+	}
+
 	return true;
+}
+
+//! Task that validates a single cached glob page by replaying the ListObjectsV2 request
+class GlobValidationTask : public BaseExecutorTask {
+public:
+	GlobValidationTask(TaskExecutor &executor, const GlobCacheRequest &request, const string &cached_response,
+	                   HTTPParams &http_params, S3AuthParams &s3_auth_params, atomic<bool> &all_valid)
+	    : BaseExecutorTask(executor), request(request), cached_response(cached_response), http_params(http_params),
+	      s3_auth_params(s3_auth_params), all_valid(all_valid) {
+	}
+
+	void ExecuteTask() override {
+		string continuation_token = request.continuation_token;
+		auto response =
+		    AWSListObjectV2::Request(request.path, http_params, s3_auth_params, continuation_token, request.use_delimiter);
+
+		// Compare parsed file lists rather than raw XML (which contains non-deterministic fields like RequestId)
+		vector<OpenFileInfo> new_files;
+		AWSListObjectV2::ParseFileList(response, new_files);
+		vector<OpenFileInfo> cached_files;
+		// Need a mutable copy for ParseFileList
+		string cached_response_copy = cached_response;
+		AWSListObjectV2::ParseFileList(cached_response_copy, cached_files);
+
+		if (new_files.size() != cached_files.size()) {
+			all_valid = false;
+			return;
+		}
+		for (idx_t i = 0; i < new_files.size(); i++) {
+			if (new_files[i].path != cached_files[i].path) {
+				all_valid = false;
+				return;
+			}
+			auto &new_info = new_files[i].extended_info;
+			auto &cached_info = cached_files[i].extended_info;
+			if (new_info && cached_info) {
+				if (new_info->options["etag"] != cached_info->options["etag"] ||
+				    new_info->options["file_size"] != cached_info->options["file_size"] ||
+				    new_info->options["last_modified"] != cached_info->options["last_modified"]) {
+					all_valid = false;
+					return;
+				}
+			}
+		}
+	}
+
+	string TaskType() const override {
+		return "GlobValidationTask";
+	}
+
+private:
+	const GlobCacheRequest &request;
+	const string &cached_response;
+	HTTPParams &http_params;
+	S3AuthParams &s3_auth_params;
+	atomic<bool> &all_valid;
+};
+
+bool S3GlobResult::TryValidateCache(GlobCacheEntry &cache_entry) {
+	if (!context) {
+		return false;
+	}
+	if (cache_entry.requests.empty()) {
+		return false;
+	}
+
+	FileOpenerInfo info = {glob_pattern};
+	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
+	auto http_params = http_util.InitializeParameters(opener, info);
+
+	// Use a mutable copy of auth params for the validation requests
+	S3AuthParams validation_auth_params = s3_auth_params;
+
+	atomic<bool> all_valid(true);
+	TaskExecutor executor(*context);
+
+	printf("[GlobCache] Validating %zu pages in parallel...\n", cache_entry.requests.size());
+	for (idx_t i = 0; i < cache_entry.requests.size(); i++) {
+		auto task = make_uniq<GlobValidationTask>(executor, cache_entry.requests[i], cache_entry.responses[i],
+		                                          *http_params, validation_auth_params, all_valid);
+		executor.ScheduleTask(std::move(task));
+	}
+	executor.WorkOnTasks();
+
+	printf("[GlobCache] Validation result: %s\n", all_valid.load() ? "VALID" : "INVALID");
+	return all_valid.load();
 }
 
 unique_ptr<MultiFileList> S3FileSystem::GlobFilesExtended(const string &path, const FileGlobInput &input,
