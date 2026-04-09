@@ -95,6 +95,16 @@ public:
 		}
 	}
 
+	//! Reset all VALIDATED ranges back to NEEDS_VALIDATION
+	void ResetValidated() {
+		lock_guard<mutex> guard(lock);
+		for (auto &range : ranges) {
+			if (range.status == RangeStatus::VALIDATED) {
+				range.status = RangeStatus::NEEDS_VALIDATION;
+			}
+		}
+	}
+
 	//! Check if cache has any ranges
 	bool IsEmpty() {
 		lock_guard<mutex> guard(lock);
@@ -147,6 +157,9 @@ public:
 	//! Get or create a transaction-scoped BucketGlobCache for a bucket.
 	//! On first access, copies from the persistent ObjectCache instance.
 	BucketGlobCache &GetBucketCache(const string &bucket, ClientContext &context) {
+		if (cache_control.empty()) {
+			RefreshCacheControl(context);
+		}
 		auto it = bucket_caches.find(bucket);
 		if (it != bucket_caches.end()) {
 			return it->second;
@@ -162,6 +175,21 @@ public:
 		return local;
 	}
 
+	//! Get the current cache control mode
+	const string &GetCacheControl() const {
+		return cache_control;
+	}
+
+	//! On query end — reset validated ranges based on cache control setting
+	void QueryEnd(ClientContext &context) override {
+		RefreshCacheControl(context);
+		if (cache_control == "query" || cache_control == "no_cache") {
+			for (auto &entry : bucket_caches) {
+				entry.second.ResetValidated();
+			}
+		}
+	}
+
 	//! On transaction commit — merge validated ranges back to persistent cache
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
 		MergeBack(context);
@@ -173,6 +201,15 @@ public:
 	}
 
 private:
+	void RefreshCacheControl(ClientContext &context) {
+		Value val;
+		if (context.TryGetCurrentSetting("httpfs_cache_control", val)) {
+			cache_control = val.GetValue<string>();
+		} else {
+			cache_control = "query";
+		}
+	}
+
 	void MergeBack(ClientContext &context) {
 		auto &obj_cache = ObjectCache::GetObjectCache(context);
 		for (auto &entry : bucket_caches) {
@@ -182,6 +219,7 @@ private:
 		bucket_caches.clear();
 	}
 
+	string cache_control;
 	unordered_map<string, BucketGlobCache> bucket_caches;
 };
 

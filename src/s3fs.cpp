@@ -1,6 +1,14 @@
 #include "s3fs.hpp"
 #include "s3_glob_cache.hpp"
+#include "httpfs_client.hpp"
 #include "crypto.hpp"
+
+// Helper for structured glob cache logging
+#define GLOB_CACHE_LOG(LOGGER, TYPE, BUCKET, PAYLOAD)                                                                  \
+	if (LOGGER && LOGGER->ShouldLog(HTTPFSInfoLogType::NAME, HTTPFSInfoLogType::LEVEL)) {                              \
+		LOGGER->WriteLog(HTTPFSInfoLogType::NAME, HTTPFSInfoLogType::LEVEL,                                            \
+		                 HTTPFSInfoLogType::ConstructLogMessage(TYPE, BUCKET, PAYLOAD));                                \
+	}
 #include "duckdb.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
 #include "duckdb/logging/log_type.hpp"
@@ -1035,6 +1043,8 @@ private:
 	mutable vector<OpenFileInfo> all_listed_files;
 	//! Whether this glob is cacheable (only flat listing globs)
 	mutable bool is_cacheable = true;
+	//! Logger for debug output
+	shared_ptr<Logger> logger;
 };
 
 S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, optional_ptr<FileOpener> opener)
@@ -1070,14 +1080,21 @@ S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, opt
 
 	fs.ReadQueryParams(parsed_s3_url.query_param, s3_auth_params);
 
+	// Initialize logger
+	{
+		FileOpenerInfo logger_info = {glob_pattern};
+		auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
+		auto init_params = http_util.InitializeParameters(opener, logger_info);
+		logger = init_params->logger;
+	}
+
 	// Check the bucket cache for ranges that cover our glob
 	if (TryUseCachedRanges()) {
-		printf("[BucketCache] HIT — using cached ranges for '%s' (%zu files)\n", glob_pattern.c_str(),
-		       expanded_files.size());
+		GLOB_CACHE_LOG(logger, "cache_hit", parsed_s3_url.bucket, StringUtil::Format("pattern=%s files=%zu", glob_pattern, expanded_files.size()));
 		finished = true;
 		all_files_expanded = true;
 	} else {
-		printf("[BucketCache] MISS or INVALID for '%s'\n", glob_pattern.c_str());
+		GLOB_CACHE_LOG(logger, "cache_miss", parsed_s3_url.bucket, StringUtil::Format("pattern=%s", glob_pattern));
 	}
 }
 
@@ -1282,8 +1299,7 @@ bool S3GlobResult::ExpandNextPath() const {
 			range_count++;
 			new_ranges.push_back(std::move(range));
 		}
-		printf("[BucketCache] STORE '%s' — %zu ranges from %zu files\n", glob_pattern.c_str(), range_count,
-		       all_listed_files.size());
+		GLOB_CACHE_LOG(logger, "cache_store", parsed_s3_url.bucket, StringUtil::Format("pattern=%s ranges=%llu files=%llu", glob_pattern, (unsigned long long)range_count, (unsigned long long)all_listed_files.size()));
 		bucket_cache.AddRanges(std::move(new_ranges));
 	}
 
@@ -1294,14 +1310,14 @@ bool S3GlobResult::ExpandNextPath() const {
 class RangeValidationTask : public BaseExecutorTask {
 public:
 	RangeValidationTask(TaskExecutor &executor, const BucketCacheRange &cached_range, const string &path,
-	                    HTTPParams &http_params, S3AuthParams &s3_auth_params, atomic<bool> &valid)
+	                    HTTPParams &http_params, S3AuthParams &s3_auth_params, atomic<bool> &valid,
+	                    shared_ptr<Logger> logger)
 	    : BaseExecutorTask(executor), cached_range(cached_range), path(path), http_params(http_params),
-	      s3_auth_params(s3_auth_params), valid(valid) {
+	      s3_auth_params(s3_auth_params), valid(valid), logger(std::move(logger)) {
 	}
 
 	void ExecuteTask() override {
-		printf("[Validate] Requesting start_after='%s' (expecting count=%llu, last_key='%s')\n",
-		       cached_range.start_after.c_str(), (unsigned long long)cached_range.count, cached_range.last_key.c_str());
+		GLOB_CACHE_LOG(logger, "cache_validate", path, StringUtil::Format("start_after=%s count=%llu last_key=%s", cached_range.start_after, (unsigned long long)cached_range.count, cached_range.last_key));
 		string continuation_token;
 		auto response = AWSListObjectV2::Request(path, http_params, s3_auth_params, continuation_token, false,
 		                                         optional_idx(cached_range.count), cached_range.start_after);
@@ -1310,15 +1326,13 @@ public:
 		AWSListObjectV2::ParseFileList(response, files);
 
 		if (files.size() != cached_range.count) {
-			printf("[Validate] FAIL count mismatch for start_after='%s': expected %llu, got %zu\n",
-			       cached_range.start_after.c_str(), (unsigned long long)cached_range.count, files.size());
+			GLOB_CACHE_LOG(logger, "cache_validate_fail", path, StringUtil::Format("count_mismatch start_after=%s expected=%llu got=%zu", cached_range.start_after, (unsigned long long)cached_range.count, files.size()));
 			valid = false;
 			return;
 		}
 
 		if (!files.empty() && files.back().path != cached_range.last_key) {
-			printf("[Validate] FAIL last_key mismatch for start_after='%s': expected '%s', got '%s'\n",
-			       cached_range.start_after.c_str(), cached_range.last_key.c_str(), files.back().path.c_str());
+			GLOB_CACHE_LOG(logger, "cache_validate_fail", path, StringUtil::Format("last_key_mismatch start_after=%s expected=%s got=%s", cached_range.start_after, cached_range.last_key, files.back().path));
 			valid = false;
 			return;
 		}
@@ -1336,13 +1350,12 @@ public:
 			}
 		}
 		if (max_lm != cached_range.max_last_modified) {
-			printf("[Validate] FAIL max_last_modified mismatch for start_after='%s': expected '%s', got '%s'\n",
-			       cached_range.start_after.c_str(), cached_range.max_last_modified.c_str(), max_lm.c_str());
+			GLOB_CACHE_LOG(logger, "cache_validate_fail", path, StringUtil::Format("max_lm_mismatch start_after=%s expected=%s got=%s", cached_range.start_after, cached_range.max_last_modified, max_lm));
 			valid = false;
 			return;
 		}
 
-		printf("[Validate] OK for start_after='%s'\n", cached_range.start_after.c_str());
+		GLOB_CACHE_LOG(logger, "cache_validate_ok", path, StringUtil::Format("start_after=%s", cached_range.start_after));
 		valid = true;
 	}
 
@@ -1356,19 +1369,21 @@ private:
 	HTTPParams &http_params;
 	S3AuthParams &s3_auth_params;
 	atomic<bool> &valid;
+	shared_ptr<Logger> logger;
 };
 
 //! Task that checks a gap for files and lists them if found
 class GapCheckTask : public BaseExecutorTask {
 public:
 	GapCheckTask(TaskExecutor &executor, const string &bucket_path, const string &gap_start, const string &gap_end,
-	             HTTPParams &http_params, S3AuthParams &s3_auth_params, atomic<bool> &has_files)
+	             HTTPParams &http_params, S3AuthParams &s3_auth_params, atomic<bool> &has_files,
+	             shared_ptr<Logger> logger)
 	    : BaseExecutorTask(executor), bucket_path(bucket_path), gap_start(gap_start), gap_end(gap_end),
-	      http_params(http_params), s3_auth_params(s3_auth_params), has_files(has_files) {
+	      http_params(http_params), s3_auth_params(s3_auth_params), has_files(has_files), logger(std::move(logger)) {
 	}
 
 	void ExecuteTask() override {
-		printf("[GapCheck] Checking gap (%s .. %s)\n", gap_start.c_str(), gap_end.empty() ? "end" : gap_end.c_str());
+		GLOB_CACHE_LOG(logger, "cache_gap_check", bucket_path, StringUtil::Format("gap_start=%s gap_end=%s", gap_start, gap_end.empty() ? "end" : gap_end));
 		string continuation_token;
 		auto response = AWSListObjectV2::Request(bucket_path, http_params, s3_auth_params, continuation_token, false,
 		                                         optional_idx(1), gap_start);
@@ -1377,12 +1392,10 @@ public:
 		AWSListObjectV2::ParseFileList(response, files);
 
 		if (!files.empty() && (gap_end.empty() || files[0].path < gap_end)) {
-			printf("[GapCheck] FOUND files in gap (%s .. %s), first: '%s'\n", gap_start.c_str(),
-			       gap_end.empty() ? "end" : gap_end.c_str(), files[0].path.c_str());
+			GLOB_CACHE_LOG(logger, "cache_gap_found", bucket_path, StringUtil::Format("gap_start=%s gap_end=%s first=%s", gap_start, gap_end.empty() ? "end" : gap_end, files[0].path));
 			has_files = true;
 		} else {
-			printf("[GapCheck] OK — gap (%s .. %s) is empty\n", gap_start.c_str(),
-			       gap_end.empty() ? "end" : gap_end.c_str());
+			GLOB_CACHE_LOG(logger, "cache_gap_empty", bucket_path, StringUtil::Format("gap_start=%s gap_end=%s", gap_start, gap_end.empty() ? "end" : gap_end));
 		}
 	}
 
@@ -1397,6 +1410,7 @@ private:
 	HTTPParams &http_params;
 	S3AuthParams &s3_auth_params;
 	atomic<bool> &has_files;
+	shared_ptr<Logger> logger;
 };
 
 //! Represents a span that needs re-listing
@@ -1427,7 +1441,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 		return false;
 	}
 
-	printf("[BucketCache] Found %zu overlapping ranges for '%s'\n", overlapping.size(), glob_pattern.c_str());
+	GLOB_CACHE_LOG(logger, "cache_lookup", parsed_s3_url.bucket, StringUtil::Format("ranges=%zu pattern=%s", overlapping.size(), glob_pattern));
 
 	FileOpenerInfo info = {glob_pattern};
 	auto &http_util = HTTPFSUtil::GetHTTPUtil(opener);
@@ -1468,7 +1482,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 				continue;
 			}
 			auto task = make_uniq<RangeValidationTask>(executor, overlapping[i], bucket_path, *http_params,
-			                                           validation_auth_params, range_valid[i]);
+			                                           validation_auth_params, range_valid[i], logger);
 			executor.ScheduleTask(std::move(task));
 			tasks_scheduled++;
 		}
@@ -1477,7 +1491,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 		auto &first_range = overlapping.front();
 		if (first_range.start_after > key_prefix || key_prefix.empty()) {
 			auto task = make_uniq<GapCheckTask>(executor, bucket_path, key_prefix, first_range.start_after,
-			                                    *http_params, validation_auth_params, gap_has_files[0]);
+			                                    *http_params, validation_auth_params, gap_has_files[0], logger);
 			executor.ScheduleTask(std::move(task));
 			tasks_scheduled++;
 		}
@@ -1488,7 +1502,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 			auto &next = overlapping[i + 1];
 			if (curr.last_key < next.start_after) {
 				auto task = make_uniq<GapCheckTask>(executor, bucket_path, curr.last_key, next.start_after,
-				                                    *http_params, validation_auth_params, gap_has_files[i + 1]);
+				                                    *http_params, validation_auth_params, gap_has_files[i + 1], logger);
 				executor.ScheduleTask(std::move(task));
 				tasks_scheduled++;
 			}
@@ -1498,13 +1512,12 @@ bool S3GlobResult::TryUseCachedRanges() {
 		auto &last_range = overlapping.back();
 		if (last_range.last_key < prefix_end || prefix_end.empty()) {
 			auto task = make_uniq<GapCheckTask>(executor, bucket_path, last_range.last_key, prefix_end, *http_params,
-			                                    validation_auth_params, gap_has_files[num_gaps - 1]);
+			                                    validation_auth_params, gap_has_files[num_gaps - 1], logger);
 			executor.ScheduleTask(std::move(task));
 			tasks_scheduled++;
 		}
 
-		printf("[BucketCache] Scheduled %llu validation tasks (%zu ranges, %zu gaps)\n",
-		       (unsigned long long)tasks_scheduled, overlapping.size(), num_gaps);
+		GLOB_CACHE_LOG(logger, "cache_validate_start", parsed_s3_url.bucket, StringUtil::Format("tasks=%llu ranges=%zu gaps=%zu", (unsigned long long)tasks_scheduled, overlapping.size(), num_gaps));
 		executor.WorkOnTasks();
 
 		// Update range status in bucket_cache based on validation results
@@ -1516,7 +1529,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 			bucket_cache.SetRangeStatus(overlapping[i].start_after, new_status);
 		}
 	} else {
-		printf("[BucketCache] All %zu ranges already VALIDATED this transaction\n", overlapping.size());
+		GLOB_CACHE_LOG(logger, "cache_already_validated", parsed_s3_url.bucket, StringUtil::Format("ranges=%zu", overlapping.size()));
 	}
 
 	// --- Phase 2: Identify spans that need re-listing ---
@@ -1527,8 +1540,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 			RelistSpan span;
 			span.start_after = (i == 0) ? key_prefix : overlapping[i - 1].last_key;
 			span.end_before = overlapping[i].start_after;
-			printf("[BucketCache] Need to relist gap (%s .. %s)\n", span.start_after.c_str(),
-			       span.end_before.c_str());
+			GLOB_CACHE_LOG(logger, "cache_relist_gap", parsed_s3_url.bucket, StringUtil::Format("start=%s end=%s", span.start_after, span.end_before));
 			relist_spans.push_back(std::move(span));
 		}
 
@@ -1538,8 +1550,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 			span.start_after = overlapping[i].start_after;
 			span.end_before =
 			    (i + 1 < overlapping.size()) ? overlapping[i + 1].start_after : prefix_end;
-			printf("[BucketCache] Need to relist invalid range (%s .. %s)\n", span.start_after.c_str(),
-			       span.end_before.empty() ? "end" : span.end_before.c_str());
+			GLOB_CACHE_LOG(logger, "cache_relist_invalid", parsed_s3_url.bucket, StringUtil::Format("start=%s end=%s", span.start_after, span.end_before.empty() ? "end" : span.end_before));
 			relist_spans.push_back(std::move(span));
 		}
 	}
@@ -1548,34 +1559,31 @@ bool S3GlobResult::TryUseCachedRanges() {
 		RelistSpan span;
 		span.start_after = overlapping.back().last_key;
 		span.end_before = prefix_end;
-		printf("[BucketCache] Need to relist trailing gap (%s .. %s)\n", span.start_after.c_str(),
-		       span.end_before.empty() ? "end" : span.end_before.c_str());
+		GLOB_CACHE_LOG(logger, "cache_relist_trailing", parsed_s3_url.bucket, StringUtil::Format("start=%s end=%s", span.start_after, span.end_before.empty() ? "end" : span.end_before));
 		relist_spans.push_back(std::move(span));
 	}
 
 	// --- Phase 3: Re-list invalid spans ---
-	// For now, do this sequentially per span (each span may need multiple pages)
 	vector<OpenFileInfo> relisted_files;
 	for (auto &span : relist_spans) {
-		printf("[BucketCache] Re-listing span (%s .. %s)\n", span.start_after.c_str(),
-		       span.end_before.empty() ? "end" : span.end_before.c_str());
+		GLOB_CACHE_LOG(logger, "cache_relist_span", parsed_s3_url.bucket, StringUtil::Format("start=%s end=%s", span.start_after, span.end_before.empty() ? "end" : span.end_before));
 		string start = span.start_after;
 		idx_t page = 0;
 		while (true) {
-			printf("[Relist] Page %llu: start_after='%s'\n", (unsigned long long)page, start.c_str());
+			GLOB_CACHE_LOG(logger, "cache_relist_page", parsed_s3_url.bucket, StringUtil::Format("page=%llu start_after=%s", (unsigned long long)page, start));
 			string continuation_token;
 			auto response = AWSListObjectV2::Request(bucket_path, *http_params, validation_auth_params,
 			                                         continuation_token, false, optional_idx(), start);
 
 			vector<OpenFileInfo> files;
 			AWSListObjectV2::ParseFileList(response, files);
-			printf("[Relist] Got %zu files\n", files.size());
+			GLOB_CACHE_LOG(logger, "cache_relist_result", parsed_s3_url.bucket, StringUtil::Format("files=%zu", files.size()));
 
 			bool reached_end = false;
 			string last_file_path;
 			for (auto &file : files) {
 				if (!span.end_before.empty() && file.path >= span.end_before) {
-					printf("[Relist] Reached end boundary at '%s'\n", file.path.c_str());
+					GLOB_CACHE_LOG(logger, "cache_relist_boundary", parsed_s3_url.bucket, StringUtil::Format("key=%s", file.path));
 					reached_end = true;
 					break;
 				}
@@ -1585,7 +1593,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 
 			auto next_token = AWSListObjectV2::ParseContinuationToken(response);
 			if (reached_end || next_token.empty() || files.empty()) {
-				printf("[Relist] Done — total relisted so far: %zu\n", relisted_files.size());
+				GLOB_CACHE_LOG(logger, "cache_relist_done", parsed_s3_url.bucket, StringUtil::Format("total=%zu", relisted_files.size()));
 				break;
 			}
 			start = last_file_path;
@@ -1594,7 +1602,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 	}
 
 	// --- Phase 4: Collect files from valid ranges + relisted files, apply glob pattern ---
-	printf("[BucketCache] Applying glob pattern to valid ranges + %zu relisted files\n", relisted_files.size());
+	GLOB_CACHE_LOG(logger, "cache_apply_pattern", parsed_s3_url.bucket, StringUtil::Format("relisted=%zu", relisted_files.size()));
 
 	const vector<string> pattern_splits = StringUtil::Split(parsed_s3_url.key, "/");
 
