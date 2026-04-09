@@ -1045,6 +1045,8 @@ private:
 	mutable bool is_cacheable = true;
 	//! Logger for debug output
 	shared_ptr<Logger> logger;
+	//! Base URL for cache key (prefix + bucket, includes endpoint)
+	string bucket_url;
 };
 
 S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, optional_ptr<FileOpener> opener)
@@ -1079,6 +1081,9 @@ S3GlobResult::S3GlobResult(S3FileSystem &fs_p, const string &glob_pattern_p, opt
 	shared_path = parsed_glob_url.substr(0, first_wildcard_pos);
 
 	fs.ReadQueryParams(parsed_s3_url.query_param, s3_auth_params);
+
+	// Cache key includes endpoint + bucket
+	bucket_url = parsed_s3_url.prefix + parsed_s3_url.bucket;
 
 	// Initialize logger
 	{
@@ -1256,7 +1261,7 @@ bool S3GlobResult::ExpandNextPath() const {
 	if (finished && is_cacheable && !all_listed_files.empty()) {
 		auto &ctx = const_cast<ClientContext &>(*context);
 		auto glob_state = ctx.registered_state->GetOrCreate<GlobCacheState>("glob_cache");
-		auto &bucket_cache = glob_state->GetBucketCache(parsed_s3_url.bucket, ctx);
+		auto &bucket_cache = glob_state->GetBucketCache(bucket_url, ctx);
 		auto now = Timestamp::GetCurrentTimestamp();
 
 		// Chunk into ranges of up to 1000 files
@@ -1425,7 +1430,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 	}
 	auto &ctx = const_cast<ClientContext &>(*context);
 	auto glob_state = ctx.registered_state->GetOrCreate<GlobCacheState>("glob_cache");
-	auto &bucket_cache = glob_state->GetBucketCache(parsed_s3_url.bucket, ctx);
+	auto &bucket_cache = glob_state->GetBucketCache(bucket_url, ctx);
 	if (bucket_cache.IsEmpty()) {
 		return false;
 	}
