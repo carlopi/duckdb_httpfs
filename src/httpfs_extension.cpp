@@ -167,7 +167,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), callback_httpfs_connection_caching);
 
 	config.AddExtensionOption("httpfs_cache_control",
-	                          "Cache control for glob results: no_cache, query, transaction",
+	                          "Cache control for glob results: no_cache, query, transaction, session",
 	                          LogicalType::VARCHAR, Value("query"));
 
 	config.AddExtensionOption("enable_global_s3_configuration",

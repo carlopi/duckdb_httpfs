@@ -193,11 +193,22 @@ public:
 	//! On transaction commit — merge validated ranges back to persistent cache
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
 		MergeBack(context);
+		// For session mode, keep the local caches; for others, reset
+		if (cache_control != "session") {
+			for (auto &entry : bucket_caches) {
+				entry.second.ResetValidated();
+			}
+		}
 	}
 
 	//! On transaction rollback — still merge, ranges are valid observations
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
 		MergeBack(context);
+		if (cache_control != "session") {
+			for (auto &entry : bucket_caches) {
+				entry.second.ResetValidated();
+			}
+		}
 	}
 
 private:
