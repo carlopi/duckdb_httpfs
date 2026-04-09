@@ -1,4 +1,5 @@
 #include "s3fs.hpp"
+#include "s3_glob_cache.hpp"
 #include "crypto.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception/http_exception.hpp"
@@ -1236,7 +1237,9 @@ bool S3GlobResult::ExpandNextPath() const {
 
 	// Build cache ranges from the accumulated files when glob is complete
 	if (finished && is_cacheable && !all_listed_files.empty()) {
-		auto &bucket_entry = fs.bucket_cache.GetOrCreateBucket(parsed_s3_url.bucket);
+		auto &ctx = const_cast<ClientContext &>(*context);
+		auto glob_state = ctx.registered_state->GetOrCreate<GlobCacheState>("glob_cache");
+		auto &bucket_cache = glob_state->GetBucketCache(parsed_s3_url.bucket, ctx);
 		auto now = Timestamp::GetCurrentTimestamp();
 
 		// Chunk into ranges of up to 1000 files
@@ -1251,10 +1254,12 @@ bool S3GlobResult::ExpandNextPath() const {
 			next_start_after = next_start_after.substr(0, wildcard_pos);
 		}
 
+		vector<BucketCacheRange> new_ranges;
 		while (i < all_listed_files.size()) {
 			BucketCacheRange range;
 			range.start_after = next_start_after;
 			range.snapshot_timestamp = now;
+			range.status = RangeStatus::VALIDATED;
 
 			idx_t end = MinValue<idx_t>(i + PAGE_SIZE, all_listed_files.size());
 			for (idx_t j = i; j < end; j++) {
@@ -1271,14 +1276,15 @@ bool S3GlobResult::ExpandNextPath() const {
 			}
 			range.count = range.files.size();
 			range.last_key = all_listed_files[end - 1].path;
-			next_start_after = range.last_key; // next range starts after this key
+			next_start_after = range.last_key;
 
 			i = end;
 			range_count++;
-			bucket_entry.InsertRange(std::move(range));
+			new_ranges.push_back(std::move(range));
 		}
 		printf("[BucketCache] STORE '%s' — %zu ranges from %zu files\n", glob_pattern.c_str(), range_count,
 		       all_listed_files.size());
+		bucket_cache.AddRanges(std::move(new_ranges));
 	}
 
 	return true;
@@ -1287,7 +1293,7 @@ bool S3GlobResult::ExpandNextPath() const {
 //! Task that validates a single cached range by re-listing using StartAfter
 class RangeValidationTask : public BaseExecutorTask {
 public:
-	RangeValidationTask(TaskExecutor &executor, BucketCacheRange &cached_range, const string &path,
+	RangeValidationTask(TaskExecutor &executor, const BucketCacheRange &cached_range, const string &path,
 	                    HTTPParams &http_params, S3AuthParams &s3_auth_params, atomic<bool> &valid)
 	    : BaseExecutorTask(executor), cached_range(cached_range), path(path), http_params(http_params),
 	      s3_auth_params(s3_auth_params), valid(valid) {
@@ -1337,7 +1343,7 @@ public:
 		}
 
 		printf("[Validate] OK for start_after='%s'\n", cached_range.start_after.c_str());
-		cached_range.snapshot_timestamp = Timestamp::GetCurrentTimestamp();
+		valid = true;
 	}
 
 	string TaskType() const override {
@@ -1345,7 +1351,7 @@ public:
 	}
 
 private:
-	BucketCacheRange &cached_range;
+	const BucketCacheRange &cached_range;
 	const string &path;
 	HTTPParams &http_params;
 	S3AuthParams &s3_auth_params;
@@ -1403,11 +1409,12 @@ bool S3GlobResult::TryUseCachedRanges() {
 	if (!context) {
 		return false;
 	}
-	if (!fs.bucket_cache.HasBucket(parsed_s3_url.bucket)) {
+	auto &ctx = const_cast<ClientContext &>(*context);
+	auto glob_state = ctx.registered_state->GetOrCreate<GlobCacheState>("glob_cache");
+	auto &bucket_cache = glob_state->GetBucketCache(parsed_s3_url.bucket, ctx);
+	if (bucket_cache.IsEmpty()) {
 		return false;
 	}
-
-	auto &bucket_entry = fs.bucket_cache.GetOrCreateBucket(parsed_s3_url.bucket);
 
 	// Use the key prefix up to the first wildcard for range matching
 	auto key_prefix = parsed_s3_url.key;
@@ -1415,7 +1422,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 	if (wildcard_pos != string::npos) {
 		key_prefix = key_prefix.substr(0, wildcard_pos);
 	}
-	auto overlapping = bucket_entry.FindOverlappingRanges(key_prefix);
+	auto overlapping = bucket_cache.GetOverlappingRanges(key_prefix);
 	if (overlapping.empty()) {
 		return false;
 	}
@@ -1433,60 +1440,83 @@ bool S3GlobResult::TryUseCachedRanges() {
 		prefix_end.back()++;
 	}
 
-	// --- Phase 1: Validate all ranges and gaps in parallel ---
-	// Per-range validity
+	// --- Phase 1: Validate ranges and gaps in parallel ---
+	// Check which ranges are already validated this transaction
+	bool all_already_validated = true;
 	vector<atomic<bool>> range_valid(overlapping.size());
 	for (idx_t i = 0; i < overlapping.size(); i++) {
-		range_valid[i] = true;
+		range_valid[i] = (overlapping[i].status == RangeStatus::VALIDATED);
+		if (overlapping[i].status != RangeStatus::VALIDATED) {
+			all_already_validated = false;
+		}
 	}
 
 	// Gap structure: before first, between each pair, after last
-	// gap[0] = before first range, gap[i+1] = after range[i], gap[N] = after last range
 	idx_t num_gaps = overlapping.size() + 1;
 	vector<atomic<bool>> gap_has_files(num_gaps);
 	for (idx_t i = 0; i < num_gaps; i++) {
 		gap_has_files[i] = false;
 	}
 
-	{
+	if (!all_already_validated) {
 		TaskExecutor executor(*context);
-		printf("[BucketCache] Validating %zu ranges + %zu gaps in parallel...\n", overlapping.size(), num_gaps);
+		idx_t tasks_scheduled = 0;
 
-		// Schedule range validations
+		// Schedule range validations (only for NEEDS_VALIDATION ranges)
 		for (idx_t i = 0; i < overlapping.size(); i++) {
-			auto task = make_uniq<RangeValidationTask>(executor, overlapping[i].get(), bucket_path, *http_params,
+			if (overlapping[i].status == RangeStatus::VALIDATED) {
+				continue;
+			}
+			auto task = make_uniq<RangeValidationTask>(executor, overlapping[i], bucket_path, *http_params,
 			                                           validation_auth_params, range_valid[i]);
 			executor.ScheduleTask(std::move(task));
+			tasks_scheduled++;
 		}
 
 		// Gap before first range
-		auto &first_range = overlapping.front().get();
+		auto &first_range = overlapping.front();
 		if (first_range.start_after > key_prefix || key_prefix.empty()) {
 			auto task = make_uniq<GapCheckTask>(executor, bucket_path, key_prefix, first_range.start_after,
 			                                    *http_params, validation_auth_params, gap_has_files[0]);
 			executor.ScheduleTask(std::move(task));
+			tasks_scheduled++;
 		}
 
 		// Gaps between ranges
 		for (idx_t i = 0; i + 1 < overlapping.size(); i++) {
-			auto &curr = overlapping[i].get();
-			auto &next = overlapping[i + 1].get();
+			auto &curr = overlapping[i];
+			auto &next = overlapping[i + 1];
 			if (curr.last_key < next.start_after) {
 				auto task = make_uniq<GapCheckTask>(executor, bucket_path, curr.last_key, next.start_after,
 				                                    *http_params, validation_auth_params, gap_has_files[i + 1]);
 				executor.ScheduleTask(std::move(task));
+				tasks_scheduled++;
 			}
 		}
 
 		// Gap after last range
-		auto &last_range = overlapping.back().get();
+		auto &last_range = overlapping.back();
 		if (last_range.last_key < prefix_end || prefix_end.empty()) {
 			auto task = make_uniq<GapCheckTask>(executor, bucket_path, last_range.last_key, prefix_end, *http_params,
 			                                    validation_auth_params, gap_has_files[num_gaps - 1]);
 			executor.ScheduleTask(std::move(task));
+			tasks_scheduled++;
 		}
 
+		printf("[BucketCache] Scheduled %llu validation tasks (%zu ranges, %zu gaps)\n",
+		       (unsigned long long)tasks_scheduled, overlapping.size(), num_gaps);
 		executor.WorkOnTasks();
+
+		// Update range status in bucket_cache based on validation results
+		for (idx_t i = 0; i < overlapping.size(); i++) {
+			if (overlapping[i].status == RangeStatus::VALIDATED) {
+				continue; // already validated, skip
+			}
+			auto new_status = range_valid[i].load() ? RangeStatus::VALIDATED : RangeStatus::INVALID;
+			bucket_cache.SetRangeStatus(overlapping[i].start_after, new_status);
+		}
+	} else {
+		printf("[BucketCache] All %zu ranges already VALIDATED this transaction\n", overlapping.size());
 	}
 
 	// --- Phase 2: Identify spans that need re-listing ---
@@ -1495,8 +1525,8 @@ bool S3GlobResult::TryUseCachedRanges() {
 		// Check gap before this range
 		if (gap_has_files[i].load()) {
 			RelistSpan span;
-			span.start_after = (i == 0) ? key_prefix : overlapping[i - 1].get().last_key;
-			span.end_before = overlapping[i].get().start_after;
+			span.start_after = (i == 0) ? key_prefix : overlapping[i - 1].last_key;
+			span.end_before = overlapping[i].start_after;
 			printf("[BucketCache] Need to relist gap (%s .. %s)\n", span.start_after.c_str(),
 			       span.end_before.c_str());
 			relist_spans.push_back(std::move(span));
@@ -1505,9 +1535,9 @@ bool S3GlobResult::TryUseCachedRanges() {
 		// Check this range itself
 		if (!range_valid[i].load()) {
 			RelistSpan span;
-			span.start_after = overlapping[i].get().start_after;
+			span.start_after = overlapping[i].start_after;
 			span.end_before =
-			    (i + 1 < overlapping.size()) ? overlapping[i + 1].get().start_after : prefix_end;
+			    (i + 1 < overlapping.size()) ? overlapping[i + 1].start_after : prefix_end;
 			printf("[BucketCache] Need to relist invalid range (%s .. %s)\n", span.start_after.c_str(),
 			       span.end_before.empty() ? "end" : span.end_before.c_str());
 			relist_spans.push_back(std::move(span));
@@ -1516,7 +1546,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 	// Check gap after last range
 	if (gap_has_files[num_gaps - 1].load()) {
 		RelistSpan span;
-		span.start_after = overlapping.back().get().last_key;
+		span.start_after = overlapping.back().last_key;
 		span.end_before = prefix_end;
 		printf("[BucketCache] Need to relist trailing gap (%s .. %s)\n", span.start_after.c_str(),
 		       span.end_before.empty() ? "end" : span.end_before.c_str());
@@ -1591,7 +1621,7 @@ bool S3GlobResult::TryUseCachedRanges() {
 		if (!range_valid[i].load()) {
 			continue;
 		}
-		for (auto &file : overlapping[i].get().files) {
+		for (auto &file : overlapping[i].files) {
 			add_matching_file(file);
 		}
 	}
@@ -1610,10 +1640,12 @@ bool S3GlobResult::TryUseCachedRanges() {
 		// First range uses the span's start_after as synthetic anchor
 		string next_start_after = relist_spans.empty() ? relisted_files[0].path : relist_spans.front().start_after;
 
+		vector<BucketCacheRange> new_ranges;
 		while (i < relisted_files.size()) {
 			BucketCacheRange range;
 			range.start_after = next_start_after;
 			range.snapshot_timestamp = now;
+			range.status = RangeStatus::VALIDATED;
 
 			idx_t end = MinValue<idx_t>(i + PAGE_SIZE, relisted_files.size());
 			for (idx_t j = i; j < end; j++) {
@@ -1633,8 +1665,9 @@ bool S3GlobResult::TryUseCachedRanges() {
 			next_start_after = range.last_key;
 
 			i = end;
-			bucket_entry.InsertRange(std::move(range));
+			new_ranges.push_back(std::move(range));
 		}
+		bucket_cache.AddRanges(std::move(new_ranges));
 	}
 
 	return true;

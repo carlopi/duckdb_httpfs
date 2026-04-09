@@ -11,7 +11,6 @@
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "httpfs.hpp"
-#include "s3_glob_cache.hpp"
 
 #include <condition_variable>
 #include <exception>
@@ -161,7 +160,6 @@ public:
 	}
 
 	BufferManager &buffer_manager;
-	BucketCache bucket_cache;
 	string GetName() const override;
 
 public:
