@@ -141,6 +141,8 @@ void HTTPClientCache::Clear() {
 static void AddUserAgentIfAvailable(HTTPFSParams &http_params, HTTPHeaders &header_map) {
 	if (!http_params.user_agent.empty()) {
 		header_map.Insert("User-Agent", http_params.user_agent);
+	} else {
+		throw InvalidConfigurationException("User Agent not found on params");
 	}
 }
 
