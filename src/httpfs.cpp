@@ -65,6 +65,8 @@ unique_ptr<HTTPParams> HTTPFSUtil::InitializeParameters(optional_ptr<FileOpener>
 		auto db = FileOpener::TryGetDatabase(opener);
 		if (db) {
 			result->user_agent = StringUtil::Format("%s %s", db->config.UserAgent(), DuckDB::SourceID());
+		} else {
+			throw InvalidConfigurationException("User Agent could not be reached");
 		}
 	}
 
