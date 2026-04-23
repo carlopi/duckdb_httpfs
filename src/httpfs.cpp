@@ -37,6 +37,7 @@ unique_ptr<HTTPParams> HTTPFSUtil::InitializeParameters(optional_ptr<FileOpener>
 
 	// No point in continuing without an opener
 	if (!opener) {
+		throw InvalidConfigurationException("NO OPENER!");
 		return std::move(result);
 	}
 
