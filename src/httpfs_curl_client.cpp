@@ -220,6 +220,9 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Get(GetRequestInfo &info) override {
+		if (!info.headers.HasHeader("User-Agent")) {
+			throw InvalidConfigurationException("User Agent not found in GET request");
+		}
 		ResetRequestInfo();
 		if (state) {
 			state->get_count++;
@@ -278,6 +281,9 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Put(PutRequestInfo &info) override {
+		if (!info.headers.HasHeader("User-Agent")) {
+			throw InvalidConfigurationException("User Agent not found in PUT request");
+		}
 		ResetRequestInfo();
 		if (state) {
 			state->put_count++;
@@ -327,6 +333,9 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Head(HeadRequestInfo &info) override {
+		if (!info.headers.HasHeader("User-Agent")) {
+			throw InvalidConfigurationException("User Agent not found in HEAD request");
+		}
 		ResetRequestInfo();
 		if (state) {
 			state->head_count++;
@@ -365,6 +374,9 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Delete(DeleteRequestInfo &info) override {
+		if (!info.headers.HasHeader("User-Agent")) {
+			throw InvalidConfigurationException("User Agent not found in DELETE request");
+		}
 		ResetRequestInfo();
 		if (state) {
 			state->delete_count++;
@@ -401,6 +413,9 @@ public:
 	}
 
 	unique_ptr<HTTPResponse> Post(PostRequestInfo &info) override {
+		if (!info.headers.HasHeader("User-Agent")) {
+			throw InvalidConfigurationException("User Agent not found in POST request");
+		}
 		ResetRequestInfo();
 		if (state) {
 			state->post_count++;
